@@ -1,0 +1,41 @@
+name: Ute Daily Check
+
+on:
+  schedule:
+    # 7:30am Perth time (Perth = UTC+8, no DST) = 23:30 UTC previous day
+    - cron: "30 23 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-listings:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install @anthropic-ai/sdk nodemailer
+
+      - name: Run ute search agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: node check-ute-listings.js
+
+      - name: Commit updated seen-listings state
+        run: |
+          git config user.name "ute-agent-bot"
+          git config user.email "actions@github.com"
+          git add seen-listings.json || true
+          git diff --quiet --cached || git commit -m "Update seen listings [skip ci]"
+          git push || true
