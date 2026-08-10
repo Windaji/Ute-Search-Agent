@@ -1,4 +1,11 @@
 {
-  "seenIds": [],
-  "lastRun": "2026-08-10T14:14:09.225Z"
+  "seenIds": [
+    "carsales-2011-patrol-dx-auto-21990",
+    "gumtree-2011-patrol-gu6-dx-cabchassis",
+    "gumtree-2011-patrol-gu-st-auto-wagon-nsw",
+    "gumtree-2013-patrol-gu8-auto-st",
+    "pickles-landcruiser-salvage-ongoing",
+    "manheim-damaged-landcruiser-ongoing"
+  ],
+  "lastRun": "2026-08-10T14:27:05.031Z"
 }
