@@ -1,15 +1,18 @@
 // Ute Search Agent
-// Searches Carsales, Gumtree, Pickles, Manheim, and Facebook Marketplace
-// for a single-cab Nissan Patrol / Toyota LandCruiser (or close alternatives)
-// under 15 years old, ideally V8 + auto (6/4-cyl and manual acceptable).
+// Searches Carsales, Gumtree, Pickles, and Manheim for a single-cab or extra-cab
+// (Patrol/LandCruiser preferred, other 4x4 utes as close matches), automatic-only,
+// under 15 years old, under $60,000, all conditions incl. damaged/salvage.
+// Uses Haiku (cheaper) for both search and extraction, capped at 8 searches/run
+// to keep API cost down.
 //
-// Runs daily via GitHub Actions. Behaviour:
+// Runs weekly via GitHub Actions (manual trigger), or daily if scheduled.
+// Behaviour:
 //  - Mon-Sat (Perth time): emails ONLY newly-found listings since last run.
 //  - Sunday (Perth time): emails the FULL list of all currently-tracked,
 //    still-available listings (a weekly roundup), regardless of "new" status.
 //
 // State is kept in seen-listings.json, committed back to the repo each run
-// so the agent has memory across days.
+// so the agent has memory across runs.
 
 import Anthropic from "@anthropic-ai/sdk";
 import nodemailer from "nodemailer";
@@ -28,11 +31,18 @@ const PROMPT = `
 Search Australian vehicle marketplaces for a used ute matching this spec.
 
 TARGET SPEC:
-- Body: single cab, chassis/tray back (not full dual cab, not wagon). ALSO acceptable:
+- Body: single cab, chassis/tray back (not full dual cab). ALSO acceptable:
   "extra cab" / "space cab" / "king cab" style (small secondary cab behind the front
   seats, 2 main doors, no full rear bench) — commonly seen on Toyota HiLux, Ford
   Ranger, Isuzu D-Max, Mazda BT-50 — treat these as close matches alongside single cabs.
   Full dual cab (4 full doors, full rear bench) is still NOT acceptable.
+  WAGONS ARE STRICTLY EXCLUDED — this means NO LandCruiser 76/200/300 Series wagons,
+  NO Patrol wagons (GU/Y61/Y62), NO Prado, NO Pajero, NO 4Runner, and no other
+  station-wagon-bodied SUV/4WD of any kind, under any circumstances, even as a
+  "close match." A ute/tray-back is a fundamentally different vehicle to a wagon —
+  do not include wagons even if everything else about them matches (engine, price, age).
+  Before including any listing, confirm it has an open tray/deck at the back, not an
+  enclosed wagon body with a rear hatch/boot.
 - Ideal models: Nissan Patrol or Toyota LandCruiser (70/79 Series etc.)
 - Other 4x4 utes acceptable as CLOSE MATCHES if genuinely comparable
   (e.g. similar heavy-duty single-cab tray 4x4s from other makes)
@@ -59,28 +69,28 @@ TARGET SPEC:
   useful content. If truly nothing qualifies at all, say so plainly rather than
   stretching the definition of "close."
 
-SITES TO SEARCH:
+SITES TO SEARCH (use at most 8 total web searches across all sites — be efficient, don't repeat similar queries):
 1. carsales.com.au
 2. gumtree.com.au
-3. pickles.com.au (auctions)
-4. manheim.com.au (auctions)
-5. Facebook Marketplace (best effort only — often not indexed; skip cleanly if inaccessible, do not guess or invent listings)
+3. pickles.com.au (auctions, including damaged/salvage sections)
+4. manheim.com.au (auctions, including damaged/salvage sections)
 
 RULES:
 - Only include REAL listings you can verify from search results with a working link. Never invent or guess a listing.
-- Clearly separate "Exact matches" (Patrol/LandCruiser, single cab) from "Close matches" (other models or slightly off-spec).
-- For each listing include: Title/model, Year, Engine (cylinders/V8, fuel type if known), Transmission, Tray/cab configuration, Price (if listed), Damage/condition status (e.g. "undamaged", "repairable write-off", "salvage", "accident damage — front end" if stated), General location, Source site, and a working URL.
-- Give each listing a short stable ID formed from: source site + year + model + price (e.g. "carsales-2015-patrol-45000") so duplicates can be detected across days.
-- If nothing matches at all on a given site, say so briefly rather than omitting the site silently.
+- Separate "Exact matches" (Patrol/LandCruiser, single cab) from "Close matches" (other models/body styles).
+- For each listing include: Title/model, Year, Engine, Transmission, Cab config, Price, Damage/condition status, Location, Source site, URL.
+- Give each listing a short stable ID: source+year+model+price (e.g. "carsales-2015-patrol-45000").
+- If a site has nothing, say so in one line rather than skipping it silently.
+- Be concise — no filler commentary, just the structured findings.
 
-Return your findings as a clearly structured list grouped by "Exact matches" then "Close matches", each listing with its ID and details as above.
+Return findings as a list grouped "Exact matches" then "Close matches".
 `;
 
 async function searchListings() {
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 6000,
-    tools: [{ type: "web_search_20250305", name: "web_search" }],
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 4000,
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
     messages: [{ role: "user", content: PROMPT }],
   });
 
@@ -92,16 +102,23 @@ async function searchListings() {
   return textBlocks;
 }
 
-// Ask Claude to convert the free-text findings into a clean JSON array of
-// {id, summary} so we can diff against previous runs reliably.
-async function extractListingIds(findingsText) {
+// Ask Claude to convert the free-text findings into a clean JSON array with
+// full structured fields per listing, so we can build a consistently
+// formatted email ourselves instead of relying on the model's free-text layout.
+async function extractListings(findingsText) {
   const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 2000,
     messages: [
       {
         role: "user",
-        content: `From the following ute search results, extract every distinct listing as a JSON array only (no markdown, no preamble, no code fences). Each item: {"id": "<the short stable ID given>", "summary": "<one line: year, model, engine, trans, price, source>"}.\n\n${findingsText}`,
+        content: `Extract every distinct listing from this ute search output as a JSON array only (no markdown, no preamble, no code fences). Each item must have exactly these fields:
+{"id": "<stable id source+year+model+price>", "matchType": "exact" or "close", "title": "<year + make + model>", "engine": "<e.g. V8 diesel>", "transmission": "<automatic>", "cab": "<single cab / extra cab / etc>", "price": "<e.g. $45,000 or 'POA'>", "condition": "<e.g. undamaged / repairable write-off>", "location": "<suburb/state>", "source": "<site name>", "url": "<link>"}
+
+Only include automatic, tray-back utes (single/extra cab) — never wagons, never manuals. If the source text already excluded these, just extract what's there.
+
+Text to extract from:
+${findingsText}`,
       },
     ],
   });
@@ -115,9 +132,54 @@ async function extractListingIds(findingsText) {
     const clean = raw.replace(/```json|```/g, "").trim();
     return JSON.parse(clean);
   } catch (err) {
-    console.error("Could not parse listing IDs, continuing with empty diff list:", err);
+    console.error("Could not parse listings, continuing with empty list:", err);
     return [];
   }
+}
+
+// Build a clean, simple, consistently-formatted plain-text email from
+// structured listing data — easier to scan than raw model output.
+function formatListingsEmail(listings) {
+  if (listings.length === 0) {
+    return "No matching listings found in this run.";
+  }
+
+  const exact = listings.filter((l) => l.matchType === "exact");
+  const close = listings.filter((l) => l.matchType === "close");
+
+  const formatListing = (l, i) =>
+    `${i + 1}. ${l.title}
+   Price:      ${l.price}
+   Engine:     ${l.engine}
+   Trans:      ${l.transmission}
+   Cab:        ${l.cab}
+   Condition:  ${l.condition}
+   Location:   ${l.location}
+   Source:     ${l.source}
+   Link:       ${l.url}`;
+
+  const sections = [];
+
+  sections.push("========================================");
+  sections.push("EXACT MATCHES (Patrol / LandCruiser)");
+  sections.push("========================================");
+  sections.push(
+    exact.length > 0
+      ? exact.map(formatListing).join("\n\n")
+      : "None found this run."
+  );
+
+  sections.push("");
+  sections.push("========================================");
+  sections.push("CLOSE MATCHES (other models)");
+  sections.push("========================================");
+  sections.push(
+    close.length > 0
+      ? close.map(formatListing).join("\n\n")
+      : "None found this run."
+  );
+
+  return sections.join("\n");
 }
 
 function loadState() {
@@ -167,7 +229,7 @@ async function main() {
   console.log(`Running in ${weeklyMode ? "WEEKLY ROUNDUP" : "DAILY NEW-ONLY"} mode`);
 
   const findingsText = await searchListings();
-  const listings = await extractListingIds(findingsText);
+  const listings = await extractListings(findingsText);
 
   const newListings = listings.filter((l) => !previousIds.has(l.id));
   const allCurrentIds = listings.map((l) => l.id);
@@ -177,8 +239,8 @@ async function main() {
   saveState({ seenIds: updatedSeenIds, lastRun: new Date().toISOString() });
 
   if (weeklyMode) {
-    const subject = `Ute Search — Weekly Roundup (${listings.length} listings tracked)`;
-    const body = `Full weekly roundup of currently available matching listings:\n\n${findingsText}`;
+    const subject = `Ute Search — Weekly Roundup (${listings.length} listings)`;
+    const body = `WEEKLY ROUNDUP — all currently available matching listings\n\n${formatListingsEmail(listings)}`;
     await sendEmail(subject, body);
     console.log("Weekly roundup email sent.");
     return;
@@ -190,8 +252,7 @@ async function main() {
   }
 
   const subject = `Ute Search — ${newListings.length} New Listing(s) Found`;
-  const newSummaries = newListings.map((l) => `- ${l.summary}`).join("\n");
-  const body = `New listings found today:\n\n${newSummaries}\n\n---\nFull details:\n\n${findingsText}`;
+  const body = `NEW LISTINGS FOUND TODAY\n\n${formatListingsEmail(newListings)}`;
   await sendEmail(subject, body);
   console.log(`Sent email with ${newListings.length} new listing(s).`);
 }
